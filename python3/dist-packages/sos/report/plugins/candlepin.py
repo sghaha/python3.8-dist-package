@@ -1,0 +1,140 @@
+# Copyright (C) 2018 Red Hat, Inc., Jake Hunsaker <jhunsake@redhat.com>
+
+# This file is part of the sos project: https://github.com/sosreport/sos
+#
+# This copyrighted material is made available to anyone wishing to use,
+# modify, copy, or redistribute it subject to the terms and conditions of
+# version 2 of the GNU General Public License.
+#
+# See the LICENSE file in the source distribution for further information.
+
+from re import match
+from shlex import quote
+from sos.report.plugins import Plugin, RedHatPlugin
+
+
+class Candlepin(Plugin, RedHatPlugin):
+
+    short_desc = 'Candlepin entitlement management'
+
+    plugin_name = 'candlepin'
+    packages = ('candlepin',)
+
+    dbhost = None
+    dbpasswd = None
+    env = None
+
+    def setup(self):
+        # for external DB, search in /etc/candlepin/candlepin.conf for:
+        # org.quartz.dataSource.myDS.URL=..
+        #
+        # and for DB password, search for
+        # org.quartz.dataSource.myDS.password=..
+        self.dbhost = "localhost"
+        self.dbpasswd = ""
+        cfg_file = "/etc/candlepin/candlepin.conf"
+        try:
+            with open(cfg_file, 'r', encoding='UTF--8') as cfile:
+                candle_lines = cfile.read().splitlines()
+            for line in candle_lines:
+                # skip empty lines and lines with comments
+                if not line or line[0] == '#':
+                    continue
+                if match(r"^\s*org.quartz.dataSource.myDS.URL=\S+", line):
+                    self.dbhost = line.split('=')[1]
+                    # separate hostname from value like
+                    # jdbc:postgresql://localhost:5432/candlepin
+                    self.dbhost = self.dbhost.split('/')[2].split(':')[0]
+                if match(r"^\s*org.quartz.dataSource.myDS.password=\S+", line):
+                    self.dbpasswd = line.split('=')[1]
+        except (IOError, IndexError):
+            # fallback when the cfg file is not accessible or parseable
+            pass
+
+        self.add_file_tags({
+            '/var/log/candlepin/candlepin.log.*': 'candlepin_log',
+            '/var/log/candlepin/err.log.*': 'candlepin_error_log',
+            '/etc/candlepin/candlepin.conf': 'candlepin_conf'
+        })
+
+        # set the password to os.environ when calling psql commands to prevent
+        # printing it in sos logs
+        # we can't set os.environ directly now: other plugins can overwrite it
+        self.env = {"PGPASSWORD": self.dbpasswd}
+
+        # Always collect the full active log of these
+        self.add_copy_spec([
+            "/var/log/candlepin/error.log",
+            "/var/log/candlepin/candlepin.log"
+        ], sizelimit=0)
+
+        # Allow limiting on logrotated logs
+        self.add_copy_spec([
+            "/etc/candlepin/candlepin.conf",
+            "/etc/candlepin/broker.xml",
+            "/var/log/candlepin/audit*.log*",
+            "/var/log/candlepin/candlepin.log[.-]*",
+            "/var/log/candlepin/cpdb*.log*",
+            "/var/log/candlepin/cpinit*.log*",
+            "/var/log/candlepin/error.log[.-]*",
+            # Specific to candlepin, ALL catalina logs are relevant. Adding it
+            # here rather than the tomcat plugin to ease maintenance and not
+            # pollute non-candlepin sosreports that enable the tomcat plugin
+            "/var/log/tomcat*/catalina*log*",
+            "/var/log/tomcat*/host-manager*log*",
+            "/var/log/tomcat*/localhost*log*",
+            "/var/log/tomcat*/manager*log*",
+        ])
+
+        self.add_cmd_output("du -sh /var/lib/candlepin/*/*")
+        # collect tables sizes, ordered
+        _cmd = self.build_query_cmd(
+            "SELECT table_name, pg_size_pretty(total_bytes) AS total, "
+            "pg_size_pretty(index_bytes) AS INDEX , "
+            "pg_size_pretty(toast_bytes) AS toast, pg_size_pretty(table_bytes)"
+            " AS TABLE FROM ( SELECT *, "
+            "total_bytes-index_bytes-COALESCE(toast_bytes,0) AS table_bytes "
+            "FROM (SELECT c.oid,nspname AS table_schema, relname AS "
+            "TABLE_NAME, c.reltuples AS row_estimate, "
+            "pg_total_relation_size(c.oid) AS total_bytes, "
+            "pg_indexes_size(c.oid) AS index_bytes, "
+            "pg_total_relation_size(reltoastrelid) AS toast_bytes "
+            "FROM pg_class c LEFT JOIN pg_namespace n ON "
+            "n.oid = c.relnamespace WHERE relkind = 'r') a) a order by "
+            "total_bytes DESC"
+        )
+        self.add_cmd_output(_cmd, suggest_filename='candlepin_db_tables_sizes',
+                            env=self.env)
+
+        _cmd = self.build_query_cmd("\
+            SELECT displayname, content_access_mode \
+            FROM cp_owner;")
+        self.add_cmd_output(_cmd,
+                            suggest_filename='simple_content_access',
+                            env=self.env)
+
+    def build_query_cmd(self, query, csv=False):
+        """
+        Builds the command needed to invoke the pgsql query as the postgres
+        user.
+        The query requires significant quoting work to satisfy both the
+        shell and postgres parsing requirements. Note that this will generate
+        a large amount of quoting in sos logs referencing the command being run
+        """
+        csvformat = "-A -F , -X" if csv else ""
+        _dbcmd = "psql --no-password -h %s -p 5432 -U candlepin \
+                  -d candlepin %s -c %s"
+        return _dbcmd % (self.dbhost, csvformat, quote(query))
+
+    def postproc(self):
+        reg = r"(((.*)(pass|token|secret)(.*))=)(.*)"
+        repl = r"\1********"
+        self.do_file_sub("/etc/candlepin/candlepin.conf", reg, repl)
+        cpdbreg = r"(--password=)([a-zA-Z0-9]*)"
+        self.do_file_sub("/var/log/candlepin/cpdb.log", cpdbreg, repl)
+        for key in ["trustStorePassword", "keyStorePassword"]:
+            self.do_file_sub("/etc/candlepin/broker.xml",
+                             fr"({key})=(\w*)([;<])",
+                             r"\1=********\3")
+
+# vim: set et ts=4 sw=4 :
